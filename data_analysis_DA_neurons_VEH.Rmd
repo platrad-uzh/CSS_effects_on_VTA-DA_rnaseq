@@ -1,0 +1,681 @@
+---
+title: "RNA-seq Data Analysis - CSS effects on the transcriptome of ventral tegmental DA neurons"
+author: "Gregorio Alanis-Lobato"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+
+library(SummarizedExperiment)
+library(SingleCellExperiment)
+library(scater)
+library(sva)
+library(mclust)
+library(PCAtools)
+library(ggplot2)
+library(ggbeeswarm)
+library(ggrepel)
+library(viridis)
+library(patchwork)
+library(DESeq2)
+library(dplyr)
+library(enrichR)
+library(pheatmap)
+library(purrr)
+library(readr)
+
+set.seed(42)
+
+```
+
+# Introduction
+
+This report contains the downstream bioinformatics analysis of data from project *2022_1191_CNS_CSS_VTA_neurons_Pryce*.
+
+```{r se_loading}
+se <- readRDS("data/SummExp_1191_CNS_CSS_VTA_neurons_VEH_Pryce.rds")
+```
+
+
+# Quality control
+
+## Depth of sequencing
+
+```{r seq_depth}
+depths <- colSums(assay(se, "counts"))
+```
+
+The depth of sequencing in this case was between `r round(min(depths)/1e6, 2)` and `r round(max(depths)/1e6, 2)` million reads per sample (an average of `r round(mean(depths)/1e6, 2)` million reads):
+
+```{r seq_depth_plot, out.width="50%"}
+ggplot(tibble(exp = "Project 1191 - DA neurons", depth = depths), aes(exp, depth)) +
+  geom_boxplot() + 
+  ggbeeswarm::geom_quasirandom() + 
+  theme_bw() + 
+  labs(x = "", y = "Sequencing depth")
+```
+
+## Identification of expressed genes
+
+We identified expressed genes based on the distribution of median expression values across samples. A Gaussian mixture model was fitted to the distribution to identify two clusters and genes whose median expression value belonged to the green cluster (see below) were filtered out from the expression matrix.
+
+```{r gene_filtering}
+# Identify expressed and non-expressed genes via Gaussian mixture model on
+# the median log2 counts  across samples
+median_across_samples <- apply(log2(assay(se, "counts") + 1), 1, median)
+g_mm <- Mclust(median_across_samples, G = 2, verbose = FALSE)
+keep <- which(g_mm$classification == 2)
+
+# Show the model on top of the distribution of medians
+MineICA::plotMix(mc=g_mm, data=median_across_samples, nbBreaks=50)
+```
+
+This leaves each sample with the following number of expressed genes (TPM >= 1):
+
+```{r expr_genes, out.width="50%"}
+
+# Focus on expressed genes
+se_expr <- se[keep, ]
+
+tpm <- assay(se_expr, "tpm")
+tb <- tibble(project = "Project 1191 - DA neurons", expr_genes = colSums(tpm >= 1), 
+             id = se_expr$sampleName) |> 
+  mutate(lbl = ifelse(expr_genes < 1e4, id, ""))
+
+ggplot(tb, aes(project, expr_genes, label = lbl)) +
+  geom_boxplot(outlier.shape = NA, width = 0.3) +
+  geom_quasirandom() +
+  ggrepel::geom_text_repel() +
+  labs(x = "", y = "Expressed genes (TPM >= 1)") +
+  theme_bw()
+
+```
+
+This represents a median of `r median(tb$expr_genes)/1e3` thousand genes.
+
+## Normalisation
+
+Then, we normalised the gene expression matrix using the [variance stabilizing transformation (VST)](https://www.bioconductor.org/packages/devel/workflows/vignettes/rnaseqGene/inst/doc/rnaseqGene.html#the-variance-stabilizing-transformation-and-the-rlog) and identified the 500 highest variable genes (HVGs) for Principal Component Analysis (PCA). Focusing on HVGs is the conventional approach and is more likely to pick up strong effects (i.e. the biological signal).
+
+```{r dds_creation}
+
+# Specify the reference level
+se_expr$MFGroup <- factor(se_expr$MFGroup)
+se_expr$MFGroup <- relevel(se_expr$MFGroup, "control_vehicle_DA_neuron")
+
+# DESeq object construction
+mtx <- as.matrix(assay(se_expr, "counts"))
+dds <- DESeqDataSetFromMatrix(countData = round(mtx), 
+                              colData = colData(se_expr), 
+                              design = ~ MFGroup)
+
+# Variance stabilizing transformation
+vsd <-  vst(dds, blind = FALSE)
+
+# Highly variable genes based on highest row variance
+hvg <- head(names(sort(apply(assay(vsd), 1, var), decreasing = T)), 500)
+```
+
+## Principal Component Analysis
+
+The following plot shows the data samples in PCA space (PC1 to PC5) based on the normalised expression matrix and the set of HVGs identified above.
+
+```{r pca_pairs, fig.height=12, fig.width=10}
+p <- pca(mat = assay(vsd)[hvg, ], metadata = colData(vsd))
+
+pairsplot(p, colby = "MFGroup")
+```
+
+Next, we zoomed into the first two PCs as they capture most of the variation between samples. Samples were coloured by experimental group:
+
+```{r pca1v2, fig.height=7, fig.width=9}
+biplot(p,
+       x = "PC1",
+       y = "PC2",
+       lab = p$metadata$sampleName,
+       colby = "MFGroup",
+       hline = 0, vline = 0,
+       legendPosition = "right",
+       legendLabSize = 9,
+       legendIconSize = 2.5)
+```
+
+Finally, we generated an eigencor plot to determine if there is any correlation between the principal components and the experimental groups (expected) or any other variable.
+
+```{r ecor_lo, fig.height=3, fig.width=9}
+eigencorplot(p,
+             components = getComponents(p)[1:10],
+             metavars = c("MFGroup", 
+                          "processing_date", "quant_ng_uL", "lib_quant_nM", 
+                          "lib_size", "donor"),
+             fontLabX = 1.5,
+             fontLabY = 1.5)
+```
+
+The eigencor plot doesn't show a significant correlation between `MFGroup` (i.e., the experimental group) and PC1. The `processing_date` and `lib_size` show a mild correlation with PC1, while `lib_quant_nM` shows a mild correlation with PC2. We don't control for these covariates in the differential expression analysis to avoid the removal of any biological signal associated with the differences between CSS and Control mice.
+
+
+## Expression of markers
+
+The following PCA plot shows the level of expression of different cell type markers in each sample to evaluate the cell type composition of these samples and assess whether they're indeed DA and GABA neurons:
+
+```{r mrk_genes, fig.height=10, fig.width=10}
+
+mrk <- tibble(marker = c("Snap25", "Slc17a7", "Gad1", "Gad2", "Aqp4", 
+                         "Opalin", "Pdgfra", "Ctss", "Ppp1r1b", "Rspo2", "Th"),
+              ensembl = c("ENSMUSG00000027273", "ENSMUSG00000070570", 
+                          "ENSMUSG00000070880", "ENSMUSG00000026787", 
+                          "ENSMUSG00000024411", "ENSMUSG00000050121", 
+                          "ENSMUSG00000029231", "ENSMUSG00000038642", 
+                          "ENSMUSG00000061718", "ENSMUSG00000051920", 
+                          "ENSMUSG00000000214"),
+              ctype = c("Neuron", "Glutamate", "GABA", "GABA", "Astrocyte", 
+                        "Oligodendrocyte", "OPC", "Microglia", "Reward", 
+                        "Aversion", "DA neuron"))
+
+p_tb <- tibble(PC1 = p$rotated$PC1, 
+               PC2 = p$rotated$PC2, 
+               group = p$metadata$MFGroup)
+p_mrk <- list()
+for(i in 1:nrow(mrk)){
+  if(mrk$ensembl[i] %in% rownames(se_expr)){
+    p_tb$expr <- log(assay(se_expr, "tpm")[mrk$ensembl[i], ] + 1)
+  }else{
+    p_tb$expr <- 0
+  }
+  
+  p_mrk[[i]] <- ggplot(p_tb, aes(x = PC1, y = PC2, 
+                                 colour = expr)) + 
+    geom_point(size = 3) + 
+    scale_colour_viridis(limits = c(0, 9)) +
+    labs(x = paste0("PC1 (", round(p$variance[1], 2), "%)"),
+         y = paste0("PC2 (", round(p$variance[2], 2), "%)"),
+         colour = "log(TPM + 1)",
+         title = paste0(mrk$marker[i], " - ", mrk$ctype[i])) +
+    theme_bw()
+}
+
+p_mrk[[i+1]] <- guide_area()
+
+wrap_plots(p_mrk, nrow = 4, ncol = 3) + 
+  plot_layout(guides = "collect")
+
+```
+
+```{r export_tpm}
+tpm_mtx <- assay(se_expr, "tpm")
+colnames(tpm_mtx) <- paste0(se_expr$sampleName, "-", se_expr$MFGroup)
+rownames(tpm_mtx) <- paste0(rowData(se_expr)$ensg, "_", rowData(se_expr)$symbol)
+as_tibble(tpm_mtx, rownames = "gene") %>% 
+  writexl::write_xlsx("data/1191_DA_neurons_VEH_TPM.xlsx")
+```
+
+
+# Differential gene expression analysis
+
+## CSS vehicle vs Control vehicle
+
+The differential gene expression analysis comparing *CSS vehicle vs control vehicle* groups led to the following number of up- and down-regulated genes: 
+
+```{r dgea_c1}
+dds <- DESeqDataSet(se_expr, design = ~ MFGroup)
+dds <- DESeq(dds)
+res <- results(dds)
+```
+
+- |log2 fold-change| > 0, FDR < 10%:
+    - Up-regulated: `r sum(res$log2FoldChange > 0 & res$padj < 0.1, na.rm = TRUE)`
+    - Down-regulated: `r sum(res$log2FoldChange < 0 & res$padj < 0.1, na.rm = TRUE)`
+- |log2 fold-change| > 0.5, p-value < 0.001:
+    - Up-regulated: `r sum(res$log2FoldChange > 0.5 & res$pvalue < 0.001, na.rm = TRUE)`
+    - Down-regulated: `r sum(res$log2FoldChange < -0.5 & res$pvalue < 0.001, na.rm = TRUE)`
+
+The following table lists the results of this analysis sorted by FDR (`padj`). Only genes with raw p-values < 0.05 are included:
+
+
+```{r tb_mfgroup_c1}
+res_expgroup <- as_tibble(res, rownames = "ensg") %>% 
+  left_join(as_tibble(rowData(se_expr)), by = "ensg") %>% 
+  dplyr::select(ensg, symbol, baseMean, log2FoldChange, pvalue, padj) %>%
+  dplyr::rename(logFC = log2FoldChange,
+                avgExpr = baseMean) %>% 
+  filter(pvalue < 0.05) %>% 
+  arrange(padj, pvalue, desc(logFC))
+
+DT::datatable(res_expgroup,
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "CSSVeh_vs_CtlVeh_dgea")
+                                            ),
+                             scrollX = TRUE
+                             )
+              ) %>% 
+  DT::formatRound("logFC", 3) %>% 
+  DT::formatSignif("pvalue", 3) %>% 
+  DT::formatSignif("padj", 3) %>% 
+  DT::formatRound("avgExpr", 3)
+```
+
+
+# Functional enrichment analysis (dysregulated genes)
+
+## CSS vehicle vs Control vehicle
+
+The following subsections report the functional enrichment analysis of the dysregulated genes (both up- and down-regulated) from contrast *CSS vehicle vs Control vehicle* (i.e. genes with |log2 fold-change| > 0.5 and p-value < 0.001). Only gene sets that significantly overlap with the list of dysregulated genes are reported (raw p-value <= 0.01).
+
+```{r fea_dys_c1}
+res <- results(dds, contrast=c("MFGroup", "CSS_vehicle_DA_neuron", "control_vehicle_DA_neuron"))
+
+res_expgroup <- as_tibble(res, rownames = "ensg") %>% 
+  left_join(as_tibble(rowData(se_expr)), by = "ensg") %>% 
+  dplyr::select(ensg, symbol, baseMean, log2FoldChange, pvalue, padj) %>%
+  dplyr::rename(logFC = log2FoldChange,
+                avgExpr = baseMean) %>% 
+  filter(abs(logFC) > 0.5 & pvalue < 0.001)
+
+sig_genes <- res_expgroup$symbol
+
+out_enrichr <- enrichr(sig_genes,
+                       databases = c("KEGG_2019_Mouse", 
+                      "GO_Biological_Process_2021", 
+                      "GO_Molecular_Function_2021",
+                      "GO_Cellular_Component_2021", 
+                      "Reactome_2022"))
+
+```
+
+### GO Biological Process
+
+```{r bp_dys_c1}
+DT::datatable(subset(out_enrichr$GO_Biological_Process_2021[, c("Term",
+                                                                "P.value",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = P.value <= 0.01),
+              extensions = "Buttons", 
+              options = list(pageLength = 10, autoWidth = TRUE,
+                             dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "CSSVeh_vs_CtlVeh_GOBP")
+                                            ),
+                             scrollX = TRUE
+                             )) %>% 
+  DT::formatSignif("Adjusted.P.value", 3) %>% 
+  DT::formatSignif("P.value", 3)
+```
+
+### GO Molecular Function
+
+```{r mf_dys_c1}
+DT::datatable(subset(out_enrichr$GO_Molecular_Function_2021[, c("Term",
+                                                                "P.value",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = P.value <= 0.01),
+              extensions = "Buttons", 
+              options = list(pageLength = 10, autoWidth = TRUE,
+                             dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "CSSVeh_vs_CtlVeh_GOMF")
+                                            ),
+                             scrollX = TRUE
+                             )) %>% 
+  DT::formatSignif("Adjusted.P.value", 3) %>% 
+  DT::formatSignif("P.value", 3)
+```
+
+### GO Cellular Component
+
+```{r cc_dys_c1}
+DT::datatable(subset(out_enrichr$GO_Cellular_Component_2021[, c("Term",
+                                                                "P.value",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = P.value <= 0.01),
+              extensions = "Buttons", 
+              options = list(pageLength = 10, autoWidth = TRUE,
+                             dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "CSSVeh_vs_CtlVeh_GOCC")
+                                            ),
+                             scrollX = TRUE
+                             )) %>% 
+  DT::formatSignif("Adjusted.P.value", 3) %>% 
+  DT::formatSignif("P.value", 3)
+```
+
+### KEGG
+
+```{r kegg_dys_c1}
+DT::datatable(subset(out_enrichr$KEGG_2019_Mouse[, c("Term",
+                                                                "P.value",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = P.value <= 0.01),
+              extensions = "Buttons", 
+              options = list(pageLength = 10, autoWidth = TRUE,
+                             dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "CSSVeh_vs_CtlVeh_KEGG")
+                                            ),
+                             scrollX = TRUE
+                             )) %>% 
+  DT::formatSignif("Adjusted.P.value", 3) %>% 
+  DT::formatSignif("P.value", 3)
+```
+
+### Reactome
+
+```{r reac_dys_c1}
+DT::datatable(subset(out_enrichr$Reactome_2022[, c("Term",
+                                                                "P.value",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = P.value <= 0.01),
+              extensions = "Buttons", 
+              options = list(pageLength = 10, autoWidth = TRUE,
+                             dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "CSSVeh_vs_CtlVeh_Reactome")
+                                            ),
+                             scrollX = TRUE
+                             )) %>% 
+  DT::formatSignif("Adjusted.P.value", 3) %>% 
+  DT::formatSignif("P.value", 3)
+```
+
+
+# Functional enrichment analysis (up-regulated genes)
+
+## CSS vehicle vs Control vehicle
+
+The following subsections report the functional enrichment analysis of the up-regulated genes from contrast *CSS vehicle vs Control vehicle* (i.e. genes with log2 fold-change > 0.5 and p-value < 0.001). Only gene sets that significantly overlap with the list of dysregulated genes are reported (raw p-value <= 0.01).
+
+```{r fea_up_c1}
+res <- results(dds, contrast=c("MFGroup", "CSS_vehicle_DA_neuron", "control_vehicle_DA_neuron"))
+
+res_expgroup <- as_tibble(res, rownames = "ensg") %>% 
+  left_join(as_tibble(rowData(se_expr)), by = "ensg") %>% 
+  dplyr::select(ensg, symbol, baseMean, log2FoldChange, pvalue, padj) %>%
+  dplyr::rename(logFC = log2FoldChange,
+                avgExpr = baseMean) %>% 
+  filter(logFC > 0.5 & pvalue < 0.001)
+
+sig_genes <- res_expgroup$symbol
+
+out_enrichr <- enrichr(sig_genes,
+                       databases = c("KEGG_2019_Mouse", 
+                      "GO_Biological_Process_2021", 
+                      "GO_Molecular_Function_2021",
+                      "GO_Cellular_Component_2021", 
+                      "Reactome_2022"))
+
+```
+
+### GO Biological Process
+
+```{r bp_up_c1}
+DT::datatable(subset(out_enrichr$GO_Biological_Process_2021[, c("Term",
+                                                                "P.value",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = P.value <= 0.01),
+              extensions = "Buttons", 
+              options = list(pageLength = 10, autoWidth = TRUE,
+                             dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "CSSVeh_vs_CtlVeh_up_GOBP")
+                                            ),
+                             scrollX = TRUE
+                             )) %>% 
+  DT::formatSignif("Adjusted.P.value", 3) %>% 
+  DT::formatSignif("P.value", 3)
+```
+
+### GO Molecular Function
+
+```{r mf_up_c1}
+DT::datatable(subset(out_enrichr$GO_Molecular_Function_2021[, c("Term",
+                                                                "P.value",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = P.value <= 0.01),
+              extensions = "Buttons", 
+              options = list(pageLength = 10, autoWidth = TRUE,
+                             dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "CSSVeh_vs_CtlVeh_up_GOMF")
+                                            ),
+                             scrollX = TRUE
+                             )) %>% 
+  DT::formatSignif("Adjusted.P.value", 3) %>% 
+  DT::formatSignif("P.value", 3)
+```
+
+### GO Cellular Component
+
+```{r cc_up_c1}
+DT::datatable(subset(out_enrichr$GO_Cellular_Component_2021[, c("Term",
+                                                                "P.value",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = P.value <= 0.01),
+              extensions = "Buttons", 
+              options = list(pageLength = 10, autoWidth = TRUE,
+                             dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "CSSVeh_vs_CtlVeh_up_GOCC")
+                                            ),
+                             scrollX = TRUE
+                             )) %>% 
+  DT::formatSignif("Adjusted.P.value", 3) %>% 
+  DT::formatSignif("P.value", 3)
+```
+
+### KEGG
+
+```{r kegg_up_c1}
+DT::datatable(subset(out_enrichr$KEGG_2019_Mouse[, c("Term",
+                                                                "P.value",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = P.value <= 0.01),
+              extensions = "Buttons", 
+              options = list(pageLength = 10, autoWidth = TRUE,
+                             dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "CSSVeh_vs_CtlVeh_up_KEGG")
+                                            ),
+                             scrollX = TRUE
+                             )) %>% 
+  DT::formatSignif("Adjusted.P.value", 3) %>% 
+  DT::formatSignif("P.value", 3)
+```
+
+### Reactome
+
+```{r reac_up_c1}
+DT::datatable(subset(out_enrichr$Reactome_2022[, c("Term",
+                                                                "P.value",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = P.value <= 0.01),
+              extensions = "Buttons", 
+              options = list(pageLength = 10, autoWidth = TRUE,
+                             dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "CSSVeh_vs_CtlVeh_up_Reactome")
+                                            ),
+                             scrollX = TRUE
+                             )) %>% 
+  DT::formatSignif("Adjusted.P.value", 3) %>% 
+  DT::formatSignif("P.value", 3)
+```
+
+
+# Functional enrichment analysis (down-regulated genes)
+
+## CSS vehicle vs Control vehicle
+
+The following subsections report the functional enrichment analysis of the down-regulated genes from contrast *CSS vehicle vs Control vehicle* (i.e. genes with log2 fold-change < -0.5 and p-value < 0.001). Only gene sets that significantly overlap with the list of dysregulated genes are reported (raw p-value <= 0.01).
+
+```{r fea_dw_c1}
+res <- results(dds, contrast=c("MFGroup", "CSS_vehicle_DA_neuron", "control_vehicle_DA_neuron"))
+
+res_expgroup <- as_tibble(res, rownames = "ensg") %>% 
+  left_join(as_tibble(rowData(se_expr)), by = "ensg") %>% 
+  dplyr::select(ensg, symbol, baseMean, log2FoldChange, pvalue, padj) %>%
+  dplyr::rename(logFC = log2FoldChange,
+                avgExpr = baseMean) %>% 
+  filter(logFC < -0.5 & pvalue < 0.001)
+
+sig_genes <- res_expgroup$symbol
+
+out_enrichr <- enrichr(sig_genes,
+                       databases = c("KEGG_2019_Mouse", 
+                      "GO_Biological_Process_2021", 
+                      "GO_Molecular_Function_2021",
+                      "GO_Cellular_Component_2021", 
+                      "Reactome_2022"))
+
+```
+
+### GO Biological Process
+
+```{r bp_dw_c1}
+DT::datatable(subset(out_enrichr$GO_Biological_Process_2021[, c("Term",
+                                                                "P.value",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = P.value <= 0.01),
+              extensions = "Buttons", 
+              options = list(pageLength = 10, autoWidth = TRUE,
+                             dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "CSSVeh_vs_CtlVeh_dw_GOBP")
+                                            ),
+                             scrollX = TRUE
+                             )) %>% 
+  DT::formatSignif("Adjusted.P.value", 3) %>% 
+  DT::formatSignif("P.value", 3)
+```
+
+### GO Molecular Function
+
+```{r mf_dw_c1}
+DT::datatable(subset(out_enrichr$GO_Molecular_Function_2021[, c("Term",
+                                                                "P.value",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = P.value <= 0.01),
+              extensions = "Buttons", 
+              options = list(pageLength = 10, autoWidth = TRUE,
+                             dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "CSSVeh_vs_CtlVeh_dw_GOMF")
+                                            ),
+                             scrollX = TRUE
+                             )) %>% 
+  DT::formatSignif("Adjusted.P.value", 3) %>% 
+  DT::formatSignif("P.value", 3)
+```
+
+### GO Cellular Component
+
+```{r cc_dw_c1}
+DT::datatable(subset(out_enrichr$GO_Cellular_Component_2021[, c("Term",
+                                                                "P.value",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = P.value <= 0.01),
+              extensions = "Buttons", 
+              options = list(pageLength = 10, autoWidth = TRUE,
+                             dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "CSSVeh_vs_CtlVeh_dw_GOCC")
+                                            ),
+                             scrollX = TRUE
+                             )) %>% 
+  DT::formatSignif("Adjusted.P.value", 3) %>% 
+  DT::formatSignif("P.value", 3)
+```
+
+### KEGG
+
+```{r kegg_dw_c1}
+DT::datatable(subset(out_enrichr$KEGG_2019_Mouse[, c("Term",
+                                                                "P.value",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = P.value <= 0.01),
+              extensions = "Buttons", 
+              options = list(pageLength = 10, autoWidth = TRUE,
+                             dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "CSSVeh_vs_CtlVeh_dw_KEGG")
+                                            ),
+                             scrollX = TRUE
+                             )) %>% 
+  DT::formatSignif("Adjusted.P.value", 3) %>% 
+  DT::formatSignif("P.value", 3)
+```
+
+### Reactome
+
+```{r reac_dw_c1}
+DT::datatable(subset(out_enrichr$Reactome_2022[, c("Term",
+                                                                "P.value",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = P.value <= 0.01),
+              extensions = "Buttons", 
+              options = list(pageLength = 10, autoWidth = TRUE,
+                             dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "CSSVeh_vs_CtlVeh_dw_Reactome")
+                                            ),
+                             scrollX = TRUE
+                             )) %>% 
+  DT::formatSignif("Adjusted.P.value", 3) %>% 
+  DT::formatSignif("P.value", 3)
+```
+
